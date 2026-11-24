@@ -46,6 +46,8 @@ DEFAULT_SETTINGS = {
     "recent_enabled": True,
     "recent": [],
     "default_eol": "\n",
+    "tab_width": 8,             # a Tab is drawn this many spaces wide (Windows: 8)
+    "tab_key": 4,               # the Tab key types this many spaces; 0 = a real Tab
 }
 
 ENCODINGS = [
@@ -534,6 +536,18 @@ def empty_pair_at(text, pos):
     return None
 
 
+def tab_array(layout, spaces):
+    """Tab stops every `spaces` space widths, measured in the layout's own font."""
+    probe = layout.copy()
+    probe.set_tabs(None)
+    probe.set_attributes(None)
+    probe.set_text(" " * spaces, -1)
+    width = probe.get_size()[0]
+    tabs = Pango.TabArray.new(1, False)      # one stop; Pango repeats the interval
+    tabs.set_tab(0, Pango.TabAlign.LEFT, max(1, width))
+    return tabs
+
+
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
@@ -597,76 +611,209 @@ class MarkdownFormatter:
         self.tag_objs = [b.get_tag_table().lookup(n) for n in self.TAGS]
         self.hidden = b.get_tag_table().lookup("hidden")
         self.ghost = b.get_tag_table().lookup("ghost")
+        self.all_tags = self.tag_objs + [self.hidden, self.ghost]
+        self.items = None
+        self.edits = []
         self.markers = []
         self.ghosts = []
         self.runs = []
+        self.run_first = []
+        self.run_hidden = []
+        self.stale = False
         self.reveal = None
         self.active = False
 
     def clear(self):
         b = self.buffer
         s, e = b.get_bounds()
-        for t in self.tag_objs:
+        for t in self.all_tags:
             b.remove_tag(t, s, e)
-        b.remove_tag(self.hidden, s, e)
-        b.remove_tag(self.ghost, s, e)
         self.markers = []
         self.ghosts = []
         self.runs = []
+        self.run_first = []
+        self.run_hidden = []
+        self.items = None
+        self.edits = []
         self.reveal = None
         self.active = False
+
+    # -- edit tracking (lets apply() restyle only what changed) -----------
+    def note_insert(self, pos, n):
+        if self.items is not None and n:
+            self.edits.append((pos, n))
+
+    def note_delete(self, pos, n):
+        if self.items is not None and n:
+            self.edits.append((pos, -n))
+
+    def _run_want(self, run, lines):
+        l0, l1 = lines
+        to_hide = len(run) - len(run) // 2
+        want = []
+        for a, z, ln in run:
+            if to_hide <= 0:
+                break
+            if l0 <= ln <= l1 or z <= a:
+                continue
+            want.append((a, z))
+            to_hide -= 1
+        return frozenset(want)
+
+    def _desired(self, text, lines):
+        ghosts, runs = [], []
+        spans, markers = parse_markdown(text, ghosts, runs)
+        items = set()
+        for name, a, z in spans:
+            if z > a:
+                items.add((name, a, z))
+        # Like Windows 11 Notepad, syntax stays hidden on every line, including
+        # the one being edited ("Markdown syntax" view shows it).
+        for a, z, _ in markers:
+            if z > a:
+                items.add(("marker", a, z))
+                items.add(("hidden", a, z))
+        for a, z, _ in ghosts:
+            items.add(("ghost", a, z))
+        self.markers, self.ghosts, self.runs = markers, ghosts, runs
+        self.run_first = [run[0][2] for run in runs]
+        self.run_hidden = [self._run_want(run, lines) for run in runs]
+        for want in self.run_hidden:
+            for a, z in want:
+                items.add(("hidden", a, z))
+        return items
+
+    def _map_old(self, text_len):
+        """Shift the previous items through the recorded edits.
+
+        Returns (shifted_items, dirty) where dirty is a list of (a, z) ranges,
+        in current offsets, that the edits touched."""
+        dirty = []
+        items = []
+        for item in self.items:
+            items.append(list(item))
+        for pos, d in self.edits:
+            gone = -d if d < 0 else 0
+            for r in dirty:
+                for k in (0, 1):
+                    if r[k] > pos:
+                        r[k] = max(pos, r[k] - gone) if d < 0 else r[k] + d
+            dirty.append([pos, pos + max(d, 0)])
+            for item in items:
+                if item[0] is None:
+                    continue
+                a, z = item[1], item[2]
+                if a <= pos + gone and z >= pos:
+                    item[0] = None          # touches the edit: restyled below
+                elif a > pos:
+                    item[1], item[2] = a + d, z + d
+        shifted = {(t, a, z) for t, a, z in items if t is not None}
+        return shifted, dirty
 
     def apply(self, lines):
         b = self.buffer
         was_modified = b.get_modified()
-        self.clear()
         s, e = b.get_bounds()
         text = b.get_text(s, e, True)
-        ghosts, runs = [], []
-        spans, markers = parse_markdown(text, ghosts, runs)
-        self.ghosts = ghosts
-        self.runs = runs
         table = b.get_tag_table()
         it = b.get_iter_at_offset
-        for name, a, z in spans:
-            if z > a:
+        incremental = self.active and self.items is not None and len(self.edits) <= 200
+        old_items = self.items if incremental else None
+        if incremental:
+            shifted, dirty = self._map_old(len(text))
+        new = self._desired(text, lines)
+        if not incremental:
+            for t in self.all_tags:
+                b.remove_tag(t, s, e)
+            for name, a, z in new:
                 b.apply_tag(table.lookup(name), it(a), it(z))
-        marker_tag = table.lookup("marker")
-        for a, z, _ in markers:
-            b.apply_tag(marker_tag, it(a), it(z))
-        self.markers = markers
+        else:
+            # widen each touched range to whole lines (plus the newline before)
+            n = len(text)
+            ranges = []
+            for a, z in dirty:
+                a = max(0, min(a, n))
+                z = max(0, min(z, n))
+                ls = text.rfind("\n", 0, a)
+                ls = max(0, ls)
+                le = text.find("\n", z)
+                le = n if le < 0 else le + 1
+                ranges.append((ls, le))
+            ranges.sort()
+            merged = []
+            for a, z in ranges:
+                if merged and a <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], z))
+                else:
+                    merged.append((a, z))
+            for a, z in merged:
+                for t in self.all_tags:
+                    b.remove_tag(t, it(a), it(z))
+
+            lo = merged[0][0] if merged else 0
+            hi = merged[-1][1] if merged else 0
+
+            def touches(a, z):
+                if not merged or z <= lo or a >= hi:
+                    return False
+                return any(a < mz and z > ma for ma, mz in merged)
+
+            to_remove = shifted - new
+            to_add = {i for i in new if i not in shifted or touches(i[1], i[2])}
+            removed = {}
+            for name, a, z in to_remove:
+                b.remove_tag(table.lookup(name), it(a), it(z))
+                removed.setdefault(name, []).append((a, z))
+            if removed:
+                # removing one range may have cut a kept range with the same tag
+                for item in new & shifted:
+                    name, a, z = item
+                    if any(a < rz and z > ra for ra, rz in removed.get(name, ())):
+                        to_add.add(item)
+            for name, a, z in to_add:
+                b.apply_tag(table.lookup(name), it(a), it(z))
+        self.items = new
+        self.edits = []
+        self.reveal = lines
+        self.stale = False
         self.active = True
-        self.update_hidden(lines, force=True)
         if b.get_modified() != was_modified:
             b.set_modified(was_modified)
 
+    def _runs_near(self, lo, hi):
+        """Indexes of blank-line runs that touch lines lo..hi."""
+        i = bisect.bisect_right(self.run_first, hi) - 1
+        out = []
+        while i >= 0 and self.runs[i][-1][2] >= lo:
+            out.append(i)
+            i -= 1
+        return out
+
     def update_hidden(self, lines, force=False):
-        if not self.active or (lines == self.reveal and not force):
+        """Paragraph breaks: show k // 2 of every k blank lines, never hiding
+        the line the cursor is on.  Only runs next to the old and new cursor
+        lines are touched, so moving the cursor doesn't re-lay-out the file."""
+        if not self.active or self.stale or (lines == self.reveal and not force):
             return
-        self.reveal = lines
+        old, self.reveal = self.reveal, lines
+        if force or old is None:
+            affected = range(len(self.runs))
+        else:
+            affected = set(self._runs_near(*old)) | set(self._runs_near(*lines))
         b = self.buffer
-        s, e = b.get_bounds()
-        b.remove_tag(self.hidden, s, e)
-        b.remove_tag(self.ghost, s, e)
-        l0, l1 = lines
         it = b.get_iter_at_offset
-        # Like Windows 11 Notepad, syntax stays hidden on every line, including
-        # the one being edited ("Markdown syntax" view shows it).
-        for a, z, ln in self.markers:
-            b.apply_tag(self.hidden, it(a), it(z))
-        for a, z, ln in self.ghosts:
-            b.apply_tag(self.ghost, it(a), it(z))
-        # paragraph breaks: show k // 2 of every k blank lines, never hiding
-        # the line the cursor is on
-        for run in self.runs:
-            to_hide = len(run) - len(run) // 2
-            for a, z, ln in run:
-                if to_hide <= 0:
-                    break
-                if l0 <= ln <= l1 or z <= a:
-                    continue
+        for i in affected:
+            want = self._run_want(self.runs[i], lines)
+            have = self.run_hidden[i]
+            for a, z in have - want:
+                b.remove_tag(self.hidden, it(a), it(z))
+                if self.items is not None:
+                    self.items.discard(("hidden", a, z))
+            for a, z in want - have:
                 b.apply_tag(self.hidden, it(a), it(z))
-                to_hide -= 1
+                if self.items is not None:
+                    self.items.add(("hidden", a, z))
+            self.run_hidden[i] = want
 
 
 # --------------------------------------------------------------------------
@@ -709,6 +856,7 @@ class Document(Gtk.ScrolledWindow):
         self.buffer.create_tag("search", background_rgba=rgba("rgba(255,200,0,0.35)"))
         self.buffer.create_tag("search-current", background_rgba=rgba("rgba(255,140,0,0.75)"))
         self.apply_wrap(win.app.settings["word_wrap"])
+        self.apply_tabs()
 
         # extra entries in the right-click menu
         menu = Gio.Menu()
@@ -745,6 +893,7 @@ class Document(Gtk.ScrolledWindow):
         self.pending = None      # (offset, marks) style to apply to typed text
         self._adjusting = False
         self.buffer.connect("insert-text", self.on_insert_text)
+        self.buffer.connect("delete-range", self.on_delete_range)
         self.buffer.connect("changed", self.on_changed)
         self.buffer.connect("modified-changed", self.on_modified_changed)
         self.buffer.connect("notify::cursor-position", self.on_cursor)
@@ -804,18 +953,28 @@ class Document(Gtk.ScrolledWindow):
         return self.markdown and not self.syntax_view and not self._too_big
 
     def cursor_lines(self):
+        """The line that must stay visible: only the cursor's own line.
+
+        Lines inside a selection are not included, so extending a selection
+        (Shift+Down) over hidden paragraph breaks doesn't reveal them."""
         b = self.buffer
-        a = b.get_iter_at_mark(b.get_insert()).get_line()
-        z = b.get_iter_at_mark(b.get_selection_bound()).get_line()
-        return (min(a, z), max(a, z))
+        line = b.get_iter_at_mark(b.get_insert()).get_line()
+        return (line, line)
 
     def schedule_format(self, delay=120):
         if self._format_source:
             GLib.source_remove(self._format_source)
-        self._format_source = GLib.timeout_add(delay, self._do_format)
+        self._format_source = GLib.timeout_add(delay, self._format_timeout)
+
+    def _format_timeout(self):
+        self._format_source = None
+        return self._do_format()
 
     def _do_format(self):
-        self._format_source = None
+        if self._format_source:
+            # called directly: the pending timer would only repeat this work
+            GLib.source_remove(self._format_source)
+            self._format_source = None
         big = self.buffer.get_char_count() > FORMAT_LIMIT
         if big and self.markdown and not self._too_big:
             self.win.toast("This file is too large for Markdown formatting.")
@@ -825,6 +984,16 @@ class Document(Gtk.ScrolledWindow):
         elif self.formatter.active or self.formatter.markers:
             self.formatter.clear()
         return False
+
+    def apply_tabs(self, later=True):
+        """Draw a Tab as wide as `tab_width` spaces of the text's real font.
+
+        A font or zoom change reaches the widget only when GTK next restyles
+        it, so measure again shortly afterwards as well."""
+        spaces = int(self.win.app.settings.get("tab_width", 8))
+        self.view.set_tabs(tab_array(self.view.create_pango_layout(""), spaces))
+        if later:
+            GLib.timeout_add(80, lambda: (self.apply_tabs(later=False), False)[1])
 
     def apply_wrap(self, wrap):
         self.view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR if wrap else Gtk.WrapMode.NONE)
@@ -945,6 +1114,7 @@ class Document(Gtk.ScrolledWindow):
 
     # -- signals ----------------------------------------------------------
     def on_changed(self, *_):
+        self.formatter.stale = True
         if self.markdown:
             self.schedule_format()
         self.win.on_doc_changed(self)
@@ -970,7 +1140,12 @@ class Document(Gtk.ScrolledWindow):
     def skip_hidden_prefix(self, it):
         """Keep the cursor after a hidden line prefix ('# ', '> ', '\\'), so
         typing at the start of a heading stays in the heading."""
-        if self._adjusting or not self.formatter.active or self.buffer.get_has_selection():
+        if self._adjusting or not self.formatter.active:
+            return
+        # Compare the marks directly: during a select-all, get_has_selection()
+        # is not updated yet when this runs, and moving the cursor here would
+        # cancel the selection.
+        if not it.equal(self.buffer.get_iter_at_mark(self.buffer.get_selection_bound())):
             return
         hidden = self.formatter.hidden
         if not it.starts_line() or not it.has_tag(hidden) or it.ends_line():
@@ -983,8 +1158,13 @@ class Document(Gtk.ScrolledWindow):
         self.buffer.place_cursor(end)
         self._adjusting = False
 
+    def on_delete_range(self, buf, start, end):
+        self.formatter.note_delete(start.get_offset(), end.get_offset() - start.get_offset())
+
     def on_insert_text(self, buf, location, text, length):
-        """Apply a pending style (Ctrl+B with nothing selected) to typed text."""
+        """Record the edit, and apply a pending style (Ctrl+B with nothing
+        selected) to typed text."""
+        self.formatter.note_insert(location.get_offset(), len(text))
         if not self.pending or self._adjusting or "\n" in text:
             return
         off, marks = self.pending
@@ -1072,7 +1252,16 @@ class Document(Gtk.ScrolledWindow):
 
         Enter writes a paragraph break (blank line) like Windows does, so files
         round-trip with Windows Notepad; Shift+Enter writes a plain line break.
-        Backspace/Delete at a paragraph edge remove the whole break at once."""
+        Backspace/Delete at a paragraph edge remove the whole break at once.
+        The Tab key types spaces (Settings → Tab key), in every view."""
+        if keyval in (Gdk.KEY_Tab, Gdk.KEY_KP_Tab) and not (
+                state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK
+                         | Gdk.ModifierType.SUPER_MASK | Gdk.ModifierType.SHIFT_MASK)):
+            spaces = int(self.win.app.settings.get("tab_key", 4))
+            if spaces > 0:
+                self.insert_text(" " * spaces)
+                return True
+            return False
         if not self.formatting_wanted():
             return False
         if state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.ALT_MASK
@@ -2139,6 +2328,7 @@ class NotepadWindow(Adw.ApplicationWindow):
             layout.set_font_description(font)
             layout.set_width(int(ctx.get_width() * Pango.SCALE))
             layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+            layout.set_tabs(tab_array(layout, int(self.app.settings.get("tab_width", 8))))
             layout.set_text(text, -1)
             height = ctx.get_height()
             breaks, top, i = [0], 0.0, 0
@@ -2497,7 +2687,7 @@ class NotepadApp(Adw.Application):
         self.settings.save()
         if key == "theme":
             self.apply_theme()
-        elif key == "font":
+        elif key in ("font", "tab_width"):
             self.update_css()
         elif key == "word_wrap":
             for w in self.notepad_windows():
@@ -2534,6 +2724,9 @@ class NotepadApp(Adw.Application):
             for d in w.docs():
                 rules.append(f"textview.doc-{d.uid} {{ font-size: {size * d.zoom / 100:.2f}pt; }}")
         self.css.load_from_string("\n".join(rules))
+        for w in self.notepad_windows():
+            for d in w.docs():
+                d.apply_tabs()
 
     def show_settings(self, win):
         s = self.settings
@@ -2571,6 +2764,10 @@ class NotepadApp(Adw.Application):
         g.add(switch("Word wrap", "Fit text within the window by default", "word_wrap"))
         g.add(switch("Formatting", "Use Markdown formatting (bold, headings, lists) in new tabs", "markdown_new"))
         g.add(switch("Status bar", "Show line, column and character count", "status_bar"))
+        g.add(combo("Tab key", "What pressing the Tab key types",
+                    [(4, "4 spaces"), (2, "2 spaces"), (8, "8 spaces"), (0, "A Tab character")], "tab_key"))
+        g.add(combo("Tab width", "How wide existing Tab characters are drawn",
+                    [(8, "8 spaces (like Windows)"), (4, "4 spaces"), (2, "2 spaces")], "tab_width"))
         g.add(combo("Line ending for new files", None,
                     [("\n", "Unix (LF)"), ("\r\n", "Windows (CRLF)")], "default_eol"))
         page.add(g)

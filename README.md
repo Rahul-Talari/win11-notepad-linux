@@ -126,8 +126,12 @@ If Notepad is already open, files are added to the existing window as new tabs.
 ## Tests
 
 ```
-python3 tests/test_markdown.py
+python3 tests/test_markdown.py   # text logic, no display needed
+python3 tests/test_gui.py        # real editing in the app on a hidden display
 ```
+
+`test_gui.py` needs `gtk4-broadwayd` (Ubuntu package `libgtk-4-bin`) and uses
+throwaway settings, so your own Notepad session is not touched.
 
 ## Where things are stored
 
